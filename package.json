@@ -1,5 +1,5 @@
 {
-  "name": "hassan-comptoire",
+  "name": "alaoui-comptoire",
   "version": "1.0.0",
   "description": "",
   "main": "main.js",
@@ -9,8 +9,8 @@
     "dist": "electron-builder"
   },
   "build": {
-    "appId": "com.yourcompany.hassancomptoire",
-    "productName": "Hassan-Comptoire",
+    "appId": "com.yourcompany.alaouicomptoire",
+    "productName": "Alaoui-Comptoire",
     "asar": true,
     "asarUnpack": [
       "backend/**"
