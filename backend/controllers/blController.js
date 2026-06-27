@@ -33,7 +33,16 @@ const generateNumeroBL = async () => {
 
   return `${prefix}${sequence.toString().padStart(4, "0")}`;
 };
-
+const parseLocalDate = (str, endOfDay = false) => {
+  const [y, m, d] = str.split("-").map(Number);
+  const date = new Date(y, m - 1, d);
+  if (endOfDay) {
+    date.setHours(23, 59, 59, 999);
+  } else {
+    date.setHours(0, 0, 0, 0);
+  }
+  return date;
+};
 // Récupérer tous les bons de livraison
 const getAllBons = async (req, res) => {
   try {
@@ -43,8 +52,32 @@ const getAllBons = async (req, res) => {
 
     // Filtrer par date
     if (startDate && endDate) {
+      const s = new Date(startDate);
+      s.setHours(0, 0, 0, 0);
+      const e = new Date(endDate);
+      e.setHours(23, 59, 59, 999);
       whereClause.date_creation = {
-        [Op.between]: [new Date(startDate), new Date(endDate)],
+        [Op.between]: [s, e],
+      };
+    } else {
+      // Default range: same-day previous month -> today (include full end day)
+      const now = new Date();
+      const end = new Date(now);
+      end.setHours(23, 59, 59, 999);
+
+      // Calculate previous month same day (or last day of prev month if shorter)
+      let prevMonth = now.getMonth() - 1;
+      let year = now.getFullYear();
+      if (prevMonth < 0) {
+        prevMonth = 11;
+        year -= 1;
+      }
+      const daysInPrevMonth = new Date(year, prevMonth + 1, 0).getDate();
+      const day = Math.min(now.getDate(), daysInPrevMonth);
+      const start = new Date(year, prevMonth, day, 0, 0, 0, 0);
+
+      whereClause.date_creation = {
+        [Op.between]: [start, end],
       };
     }
 
@@ -895,6 +928,163 @@ const updateStatus = async (req, res) => {
     });
   }
 };
+// Gestion de la page Caissier — retourner les BL avec montants calculés pour une plage de date
+const getBonLivraisonsByDate = async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+
+    if (!startDate || !endDate) {
+      return res
+        .status(400)
+        .json({ message: "startDate and endDate are required" });
+    }
+
+    // 1. Build local date range
+    const s = parseLocalDate(startDate, false);
+    const e = parseLocalDate(endDate, true);
+
+    // 2. Find BL IDs that have advancements in this range
+    const fkColumn = Advancement.rawAttributes.bon_livraison_id
+      ? "bon_livraison_id"
+      : "bonLivraisonId";
+
+    const advancementMatches = await Advancement.findAll({
+      where: {
+        paymentDate: { [Op.between]: [s, e] },
+        [fkColumn]: { [Op.not]: null },
+      },
+      attributes: [fkColumn],
+      group: [fkColumn],
+      raw: true,
+    });
+
+    const matchedIds = advancementMatches.map((a) => a[fkColumn]);
+
+    // 3. Fetch BLs created in range OR with advancements in range
+    const bonLivraisons = await BonLivraison.findAll({
+      where: {
+        [Op.or]: [
+          { date_creation: { [Op.between]: [s, e] } },
+          ...(matchedIds.length ? [{ id: { [Op.in]: matchedIds } }] : []),
+        ],
+      },
+      include: [
+        {
+          model: Client,
+          as: "client",
+          attributes: ["id", "nom_complete", "telephone"],
+        },
+        {
+          model: Advancement,
+          as: "advancements",
+          required: false,
+          // Fetch ALL advancements (not filtered by date) so remainingAmount is always correct
+          attributes: ["id", "amount", "paymentDate", "paymentMethod"],
+        },
+      ],
+      order: [["date_creation", "DESC"]],
+    });
+
+    // 4. Map & compute
+    const result = bonLivraisons.map((bon) => {
+      const b = bon.toJSON();
+      const allAdv = b.advancements || [];
+
+      // Total of ALL advancements (for remainingAmount)
+      const totalAdvAll = allAdv.reduce(
+        (sum, a) => sum + parseFloat(a.amount || 0),
+        0,
+      );
+
+      // Advancements ONLY inside the requested date range (for paidOnDate)
+      const todaysAdv = allAdv.filter((a) => {
+        if (!a.paymentDate) return false;
+        const pd = new Date(a.paymentDate);
+        return pd >= s && pd <= e;
+      });
+
+      const paidOnDate = todaysAdv.reduce(
+        (sum, a) => sum + parseFloat(a.amount || 0),
+        0,
+      );
+
+      const montantTTC = parseFloat(b.montant_ttc || 0);
+      const remainingAmount = Math.max(0, montantTTC - totalAdvAll);
+
+      // Status normalisation
+      const statusMap = {
+        payé: "payée",
+        payee: "payée",
+        paid: "payée",
+        partiellement_payée: "partiellement_payée",
+        partiellement_payee: "partiellement_payée",
+        brouillon: "brouillon",
+        envoyée: "envoyée",
+        envoyee: "envoyée",
+        annulée: "annulée",
+        annulee: "annulée",
+        en_attente: "en_attente",
+        en_retard: "en_retard",
+      };
+
+      // Payment method normalisation
+      const paymentTypeMap = {
+        espèces: "espece",
+        espece: "espece",
+        chèque: "cheque",
+        cheque: "cheque",
+        virement: "virement",
+        carte_bancaire: "carte",
+        carte: "carte",
+        multiple: "multiple",
+        autre: "autre",
+      };
+
+      // Determine today's payment type from advancements
+      let paymentType =
+        paymentTypeMap[b.mode_reglement] || b.mode_reglement || "non_paye";
+
+      if (todaysAdv.length > 0) {
+        const methods = [
+          ...new Set(todaysAdv.map((a) => a.paymentMethod).filter(Boolean)),
+        ];
+        if (methods.length > 1) {
+          paymentType = "multiple";
+        } else if (methods.length === 1) {
+          paymentType = paymentTypeMap[methods[0]] || methods[0];
+        }
+      }
+
+      return {
+        id: b.id,
+        deliveryNumber: b.num_bon_livraison,
+        customerName: b.client?.nom_complete || "",
+        customerPhone: b.client?.telephone || "",
+        total: montantTTC,
+        advancement: totalAdvAll,
+        remainingAmount: remainingAmount.toFixed(2),
+        status: statusMap[b.status] || b.status || "brouillon",
+        paymentType,
+        createdAt: b.date_creation,
+        // Only return today's advancements to the frontend
+        advancements: todaysAdv.map((a) => ({
+          id: a.id,
+          amount: parseFloat(a.amount || 0),
+          paymentDate: a.paymentDate,
+          paymentMethod: a.paymentMethod,
+        })),
+        paidOnDate,
+      };
+    });
+
+    return res.json(result);
+  } catch (err) {
+    console.error("Get delivery notes by date error:", err);
+    return res
+      .status(500)
+      .json({ message: "Server error", error: err.message });
+  }
+};
 
 // Supprimer un bon de livraison
 const deleteBon = async (req, res) => {
@@ -1102,4 +1292,5 @@ module.exports = {
   deleteBon,
   getStats,
   getBonsByClient,
+  getBonLivraisonsByDate,
 };
